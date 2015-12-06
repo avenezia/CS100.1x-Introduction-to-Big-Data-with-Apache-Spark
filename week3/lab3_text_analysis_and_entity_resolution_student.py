@@ -657,3 +657,119 @@ Test.assertEquals(len(idfsSmallBroadcast.value), 4772, 'incorrect idfsSmallBroad
 Test.assertTrue(abs(similarityAmazonGoogleBroadcast - 0.000303171940451) < 0.0000001,
                 'incorrect similarityAmazonGoogle')
 
+
+# ### **(3e) Perform a Gold Standard evaluation**
+# #### First, we'll load the "gold standard" data and use it to answer several questions. We read and parse the Gold Standard data, where the format of each line is "Amazon Product ID","Google URL". The resulting RDD has elements of the form ("AmazonID GoogleURL", 'gold')
+
+# In[20]:
+
+GOLDFILE_PATTERN = '^(.+),(.+)'
+
+# Parse each line of a data file using the specified regular expression pattern
+def parse_goldfile_line(goldfile_line):
+    """ Parse a line from the 'golden standard' data file
+    Args:
+        goldfile_line: a line of data
+    Returns:
+        pair: ((key, 'gold', 1 if successful or else 0))
+    """
+    match = re.search(GOLDFILE_PATTERN, goldfile_line)
+    if match is None:
+        print 'Invalid goldfile line: %s' % goldfile_line
+        return (goldfile_line, -1)
+    elif match.group(1) == '"idAmazon"':
+        print 'Header datafile line: %s' % goldfile_line
+        return (goldfile_line, 0)
+    else:
+        key = '%s %s' % (removeQuotes(match.group(1)), removeQuotes(match.group(2)))
+        return ((key, 'gold'), 1)
+
+goldfile = os.path.join(baseDir, inputPath, GOLD_STANDARD_PATH)
+gsRaw = (sc
+         .textFile(goldfile)
+         .map(parse_goldfile_line)
+         .cache())
+
+gsFailed = (gsRaw
+            .filter(lambda s: s[1] == -1)
+            .map(lambda s: s[0]))
+for line in gsFailed.take(10):
+    print 'Invalid goldfile line: %s' % line
+
+goldStandard = (gsRaw
+                .filter(lambda s: s[1] == 1)
+                .map(lambda s: s[0])
+                .cache())
+
+print 'Read %d lines, successfully parsed %d lines, failed to parse %d lines' % (gsRaw.count(),
+                                                                                 goldStandard.count(),
+                                                                                 gsFailed.count())
+assert (gsFailed.count() == 0)
+assert (gsRaw.count() == (goldStandard.count() + 1))
+
+
+# ### Using the "gold standard" data we can answer the following questions:
+# * #### How many true duplicate pairs are there in the small datasets?
+# * #### What is the average similarity score for true duplicates?
+# * #### What about for non-duplicates?
+# #### The steps you should perform are:
+# * #### Create a new `sims` RDD from the `similaritiesBroadcast` RDD, where each element consists of a pair of the form ("AmazonID GoogleURL", cosineSimilarityScore). An example entry from `sims` is: ('b000bi7uqs http://www.google.com/base/feeds/snippets/18403148885652932189', 0.40202896125621296)
+# * #### Combine the `sims` RDD with the `goldStandard` RDD by creating a new `trueDupsRDD` RDD that has the just the cosine similarity scores for those "AmazonID GoogleURL" pairs that appear in both the `sims` RDD and `goldStandard` RDD. Hint: you can do this using the join() transformation.
+# * #### Count the number of true duplicate pairs in the `trueDupsRDD` dataset
+# * #### Compute the average similarity score for true duplicates in the `trueDupsRDD` datasets. Remember to use `float` for calculation
+# * #### Create a new `nonDupsRDD` RDD that has the just the cosine similarity scores for those "AmazonID GoogleURL" pairs from the `similaritiesBroadcast` RDD that **do not** appear in both the *sims* RDD and gold standard RDD.
+# * #### Compute the average similarity score for non-duplicates in the last datasets. Remember to use `float` for calculation
+
+# In[40]:
+
+sims = similaritiesBroadcast.map(lambda (googleId, amazonId, cosineSimilarity): (amazonId + " " + googleId, cosineSimilarity))
+
+trueDupsRDD = (sims
+               .join(goldStandard))
+trueDupsCount = trueDupsRDD.count()
+avgSimDups = trueDupsRDD.map(lambda (key, value): value[0]).sum() / trueDupsCount
+
+nonDupsRDD = (sims
+              .leftOuterJoin(goldStandard).filter(lambda (key, value): value[1] is None))
+avgSimNon = nonDupsRDD.map(lambda (key, value): value[0]).sum() / nonDupsRDD.count()
+
+print 'There are %s true duplicates.' % trueDupsCount
+print 'The average similarity of true duplicates is %s.' % avgSimDups
+print 'And for non duplicates, it is %s.' % avgSimNon
+
+
+# In[41]:
+
+# TEST Perform a Gold Standard evaluation (3e)
+Test.assertEquals(trueDupsCount, 146, 'incorrect trueDupsCount')
+Test.assertTrue(abs(avgSimDups - 0.264332573435) < 0.0000001, 'incorrect avgSimDups')
+Test.assertTrue(abs(avgSimNon - 0.00123476304656) < 0.0000001, 'incorrect avgSimNon')
+
+
+# ### **Part 4: Scalable ER**
+# #### In the previous parts, we built a text similarity function and used it for small scale entity resolution.  Our implementation is limited by its quadratic run time complexity, and is not practical for even modestly sized datasets.  In this part, we will implement a more scalable algorithm and use it to do entity resolution on the full dataset.
+# ### Inverted Indices
+# #### To improve our ER algorithm from the earlier parts, we should begin by analyzing its running time. In particular, the algorithm above is quadratic in two ways. First, we did a lot of redundant computation of tokens and weights, since each record was reprocessed every time it was compared. Second, we made quadratically many token comparisons between records.
+# #### The first source of quadratic overhead can be eliminated with precomputation and look-up tables, but the second source is a little more tricky. In the worst case, every token in every record in one dataset exists in every record in the other dataset, and therefore every token makes a non-zero contribution to the cosine similarity. In this case, token comparison is unavoidably quadratic.
+# #### But in reality most records have nothing (or very little) in common. Moreover, it is typical for a record in one dataset to have at most one duplicate record in the other dataset (this is the case assuming each dataset has been de-duplicated against itself). In this case, the output is linear in the size of the input and we can hope to achieve linear running time.
+# #### An [**inverted index**](https://en.wikipedia.org/wiki/Inverted_index) is a data structure that will allow us to avoid making quadratically many token comparisons.  It maps each token in the dataset to the list of documents that contain the token.  So, instead of comparing, record by record, each token to every other token to see if they match, we will use inverted indices to *look up* records that match on a particular token.
+# > #### **Note on terminology**: In text search, a *forward* index maps documents in a dataset to the tokens they contain.  An *inverted* index supports the inverse mapping.
+# > #### **Note**: For this section, use the complete Google and Amazon datasets, not the samples
+
+# ### **(4a) Tokenize the full dataset**
+# #### Tokenize each of the two full datasets for Google and Amazon.
+
+# In[42]:
+
+amazonFullRecToToken = amazon.map(lambda (id, values): (id, tokenize(values)))
+googleFullRecToToken = google.map(lambda (id, values): (id, tokenize(values)))
+print 'Amazon full dataset is %s products, Google full dataset is %s products' % (amazonFullRecToToken.count(),
+                                                                                  googleFullRecToToken.count())
+
+
+# In[43]:
+
+# TEST Tokenize the full dataset (4a)
+Test.assertEquals(amazonFullRecToToken.count(), 1363, 'incorrect amazonFullRecToToken.count()')
+Test.assertEquals(googleFullRecToToken.count(), 3226, 'incorrect googleFullRecToToken.count()')
+
